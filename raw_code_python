@@ -1,0 +1,214 @@
+import requests
+import xml.etree.ElementTree as ET
+import matplotlib.pyplot as plt
+import pandas as pd
+import ipywidgets as widgets
+from IPython.display import display, clear_output
+from scipy.stats import ttest_ind
+import csv
+
+income_level_codes = {
+    'Low income': "LIC",
+    'Lower middle income': "LMC",
+    'Upper middle income': "UMC"
+}
+
+# fetch income groups
+# per page = 300 to get all countries in one request
+url = "https://api.worldbank.org/v2/country?format=xml&per_page=300"
+response = requests.get(url)
+
+root = ET.fromstring(response.content)
+
+# Define the namespace
+namespace = {'wb': 'http://www.worldbank.org'}
+
+# Extract country codes and income levels
+country_dict = {}
+country_dict['LIC'] = []
+country_dict['LMC'] = []
+country_dict['UMC'] = []
+
+for country in root.findall('wb:country', namespace):
+    country_id = country.get('id')
+    income_level = country.find('wb:incomeLevel', namespace).text
+
+    for description, code in income_level_codes.items():
+        if description == income_level:
+            country_dict[code].append(country_id)
+
+# fetch indicators
+# List of indicators (for diarrhea prevalence and treatment in poorest vs richest quintiles)
+indicators = {
+    "Prevalence": {
+        "Diarrhea prevalence of children under the age of 5 - Poorest quintile": "SH.STA.DIRH.Q1.ZS",
+        "Diarrhea prevalence of children under the age of 5 - Richest quintile": "SH.STA.DIRH.Q5.ZS",
+    },
+    "Treatment": {
+        "Diarrhea treatment of children under the age of 5 - Poorest quintile": "SH.STA.ORHF.Q1.ZS",
+        "Diarrhea treatment of children under the age of 5 - Richest quintile": "SH.STA.ORHF.Q5.ZS",
+    },
+}
+
+
+# fetch the most recent year of data for a specific country and indicator
+def fetch_latest_data(indicator):
+    # mrnev=1 get most recent non-empty
+    url = f"https://api.worldbank.org/v2/country/all/indicator/{indicator}?mrnev=1&format=xml&per_page=300"
+    response = requests.get(url)
+    if response.status_code == 200:
+        try:
+            data = response.content
+            return ET.fromstring(response.content)
+        except Exception as e:
+            print(f"Error processing data for {indicator}: {e}")
+    return None
+
+
+# Fetch data for each indicator and country
+indicator_dict = {}
+for income_group, income_code in income_level_codes.items():
+    indicator_dict[income_code] = {}
+
+    for prev_treat, indicator_codes in indicators.items():
+        indicator_dict[income_code][prev_treat] = {}
+
+        for indicator_name, indicator_code in indicator_codes.items():
+            indicator_dict[income_code][prev_treat][indicator_code] = {}
+
+            record = fetch_latest_data(indicator_code)
+            for data in record.findall("wb:data", namespace):
+                iso3code = data.find("wb:countryiso3code", namespace).text
+                value = data.find("wb:value", namespace).text
+
+                for country_income_group, country_list in country_dict.items():
+                    if income_code == country_income_group:
+                        for country in country_list:
+                            if country == iso3code:
+                                indicator_dict[income_code][prev_treat][indicator_code][iso3code] = value
+
+# Function to save dictionary data to a CSV file
+def save_data_to_csv(data, filename="data.csv"):
+    with open(filename, mode="w", newline="") as file:
+        writer = csv.writer(file)
+        # Write the header
+        writer.writerow(["Indicator", "Country", "Percentage"])
+
+        # Write data rows
+        for indicator, countries in data.items():
+            for country, percentage in countries.items():
+                writer.writerow([indicator, country, percentage])
+    print(f"Data saved to {filename}")
+
+def get_indicator_data(selected_income_group, selected_indicator):
+    rich_vs_poor = {}
+
+    for _, indicator_code in indicators[selected_indicator].items():
+        rich_vs_poor[indicator_code] = indicator_dict[selected_income_group][selected_indicator][indicator_code]
+
+    return rich_vs_poor
+
+def calculate_t_test(data):
+    # Extract values as floats
+    vals = []
+    for subdict in data.values():
+        vals.append(list(map(float, subdict.values())))
+
+    if len(vals) != 2:
+        raise ValueError("The data should contain exactly two groups for a t-test.")
+
+    # Perform a two-sample independent t-test
+    return ttest_ind(vals[0], vals[1])
+
+# Create GUI with ipywidgets
+income_group_selector = widgets.Dropdown(
+    options=list(income_level_codes.keys()),
+    description='Income Group:',
+    style={'description_width': 'initial'}
+)
+
+indicator_selector = widgets.Dropdown(
+    options=list(indicators.keys()),
+    description='Indicator:',
+    style={'description_width': 'initial'}
+)
+
+fetch_button = widgets.Button(
+    description="Get Data",
+    button_style='success',
+    tooltip='Display visualization',
+    icon='search'
+)
+
+output_area = widgets.Output()
+
+# Fetch and visualize data on button click
+def on_fetch_button_click(b):
+    with output_area:
+        clear_output()
+        selected_income_group = income_group_selector.value
+        selected_income_code = income_level_codes[selected_income_group]
+        selected_indicator_name = indicator_selector.value
+        # selected_indicator_code = indicators[selected_indicator_name]
+
+        # Display boxplot
+        data = get_indicator_data(selected_income_code, selected_indicator_name)
+
+        # Prepare boxplot data
+        values = [list(map(float, subdict.values())) for subdict in data.values()]
+        labels = []
+        for key in data.keys():
+            if 'Q1' in key:
+                labels.append('poorest quintile')
+            if 'Q5' in key:
+                labels.append('richest quintile')
+
+        # Create the boxplot
+        fig, ax = plt.subplots()
+        ax.boxplot(values, labels=labels)
+        ax.set_ylabel("Percentage (%)")
+        ax.set_title(f"{selected_indicator_name} of diarrhea in {selected_income_group.lower()} countries")
+        plt.show()
+
+        # Save CSV data
+        download_button = widgets.Button(
+            description="Download CSV",
+            button_style='info'
+        )
+
+        def on_download_button_click(d):
+            save_data_to_csv(data, filename = f"{selected_income_code}_{selected_indicator_name}.csv")
+
+        download_button.on_click(on_download_button_click)
+        display(download_button)
+
+        # ttest
+        t_test_button = widgets.Button(
+            description='t test',
+            button_style='info',
+            tooltip='Calculate t statistic'
+        )
+
+        def on_ttest_button_click(d):
+            t_stat, p_value = calculate_t_test(data)
+
+            # Print the results
+            with output_area:
+                display(f"T-statistic: {t_stat}")
+                display(f"P-value: {p_value}")
+
+                # Interpretation
+                alpha = 0.05
+                if p_value < alpha:
+                    display("The difference between the two groups is statistically significant.")
+                else:
+                    display("The difference between the two groups is not statistically significant.")
+
+        t_test_button.on_click(on_ttest_button_click)
+        display(t_test_button)
+
+
+fetch_button.on_click(on_fetch_button_click)
+
+# Display widgets
+display(widgets.VBox([income_group_selector, indicator_selector, fetch_button, output_area]))
